@@ -11,7 +11,7 @@ from ufl.domain import extract_unique_domain
 from pyadjoint import annotate_tape
 import ctypes
 from ctypes import POINTER, c_int, c_double, c_void_p
-from collections.abc import Collection
+from collections.abc import Collection, Sequence
 from numbers import Number
 from functools import partial
 from typing import Tuple
@@ -322,23 +322,25 @@ class Function(ufl.Coefficient, FunctionMixin):
         return readonly(components)
 
     @PETSc.Log.EventDecorator()
-    def sub(self, indices: tuple[int] | int) -> "Function":
-        """Extract the i-th sub function of this function.
+    @FunctionMixin._ad_annotate_sub
+    def sub(self, indices: Sequence[int] | int) -> "Function":
+        """Extract a view of selected subfunctions or a tensor component.
 
-        If the `Function` is defined on a `~.VectorFunctionSpace` or
-        `~.TensorFunctionSpace` this returns a proxy object indexing the 'i'th
-        component of the space, suitable for use in boundary condition application.
+        For a vector or tensor function, the component view can be used to
+        apply boundary conditions.
 
         Parameters
         ----------
-        indices
-            Indices indicating the sub function to extract. If an `int` is
-            used then this is converted into a `tuple`.
+        indices : int or sequence of int
+            For a mixed function, an integer selects one subfunction and a
+            tuple or list selects subfunctions in the given order. A sequence with one
+            index returns an unmixed function. For a vector or tensor function, the indices
+            select a component.
 
         Returns
         -------
         firedrake.function.Function
-            The sub function.
+            A function that shares data with the selected subfunctions or component.
 
         See Also
         --------
@@ -346,6 +348,13 @@ class Function(ufl.Coefficient, FunctionMixin):
 
         """
         if is_mixed(self.function_space()):
+            if isinstance(indices, (tuple, list)):
+                indices = tuple(indices)
+                V = self.function_space()
+                W = V.sub(indices)
+                labels = [V._labels[j] for j in indices]
+                slice_ = labels[0] if len(labels) == 1 else labels
+                return type(self)(W, val=self.dat[slice_])
             return self.subfunctions[indices]
         elif not self.function_space().shape:
             # TODO: Decide if this is acceptable usage

@@ -291,8 +291,30 @@ class WithGeometryBase:
         return utils.readonly(components)
 
     @PETSc.Log.EventDecorator()
-    def sub(self, indices):
+    def sub(self, indices: Sequence[int] | int) -> WithGeometryBase:
+        """Select subspaces of a mixed space or a tensor component.
+
+        Parameters
+        ----------
+        indices : int or sequence of int
+            For a mixed space, an integer selects an indexed subspace and a
+            nonempty tuple or list selects distinct subspaces in the given
+            order. For a vector or tensor space, the indices select a
+            component.
+
+        Returns
+        -------
+        WithGeometryBase
+            The selected space. Sequence selection from a mixed space returns
+            a collapsed space; a single selected subspace is unmixed.
+        """
         if type(self.ufl_element()) is finat.ufl.MixedElement:
+            if isinstance(indices, (tuple, list)):
+                indices = tuple(indices)
+                W = self.topological.sub(indices)
+                meshes = [self.mesh()[i] for i in indices]
+                mesh = meshes[0] if len(meshes) == 1 else MeshSequenceGeometry(meshes)
+                return type(self)(W, mesh)
             return self.subspaces[indices]
         else:
             indices = parse_component_indices(indices, self.shape)
@@ -2087,9 +2109,33 @@ class MixedFunctionSpace(AbstractFunctionSpace):
         :class:`MixedFunctionSpace` is composed."""
         return self._spaces
 
-    def sub(self, i):
-        r"""Return the `i`th :class:`FunctionSpace` in this
-        :class:`MixedFunctionSpace`."""
+    def sub(self, i: Sequence[int] | int) -> FunctionSpace | MixedFunctionSpace:
+        """Select subspaces of this mixed space.
+
+        Parameters
+        ----------
+        i : int or sequence of int
+            An integer selects an indexed subspace. A nonempty tuple or list
+            selects distinct subspaces in the given order.
+
+        Returns
+        -------
+        FunctionSpace or MixedFunctionSpace
+            The selected space. Sequence selection returns a collapsed space;
+            a single selected subspace is unmixed.
+        """
+        if isinstance(i, (tuple, list)):
+            i = tuple(i)
+            if not i:
+                raise ValueError("At least one subspace must be selected.")
+            if len(set(range(len(self))[j] for j in i)) != len(i):
+                raise ValueError(f"Each subspace can be selected only once, not {i}.")
+            if len(i) == 1:
+                return self._spaces[i[0]].collapse()
+            spaces = [self._spaces[j] for j in i]
+            mesh = MeshSequenceTopology([self.mesh()[j] for j in i])
+            labels = [self._labels[j] for j in i]
+            return type(self)(spaces, mesh, _labels=labels)
         return self._spaces[i]
 
     def num_sub_spaces(self):

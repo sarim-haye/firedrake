@@ -1,3 +1,4 @@
+from collections.abc import Sequence
 from functools import cached_property
 import numpy as np
 import ufl
@@ -143,18 +144,35 @@ class Cofunction(ufl.Cofunction, CofunctionMixin):
         return utils.readonly(components)
 
     @PETSc.Log.EventDecorator()
-    def sub(self, i):
-        r"""Extract the ith sub :class:`Cofunction` of this :class:`Cofunction`.
+    @CofunctionMixin._ad_annotate_sub
+    def sub(self, i: Sequence[int] | int) -> "Cofunction":
+        """Extract a view of selected subfunctions or a tensor component.
 
-        :arg i: the index to extract
+        Parameters
+        ----------
+        i : int or sequence of int
+            For a mixed cofunction, an integer selects one subfunction and a
+            tuple or list selects subfunctions in the given order. A sequence with one
+            index returns an unmixed cofunction. For a vector or tensor cofunction, the
+            indices select a component.
 
-        See also :attr:`subfunctions`.
+        Returns
+        -------
+        Cofunction
+            A cofunction that shares data with the selected subfunctions or component.
 
-        If the :class:`Cofunction` is defined on a
-        :func:`~.VectorFunctionSpace` or :func:`~.TensorFunctionSpace`
-        this returns a proxy object indexing the ith component of the space,
-        suitable for use in boundary condition application."""
+        See Also
+        --------
+        subfunctions
+        """
         if type(self.function_space().ufl_element()) is MixedElement:
+            if isinstance(i, (tuple, list)):
+                i = tuple(i)
+                V = self.function_space()
+                W = V.sub(i)
+                labels = [V._labels[j] for j in i]
+                slice_ = labels[0] if len(labels) == 1 else labels
+                return type(self)(W, val=self.dat[slice_])
             return self.subfunctions[i]
         elif not self.function_space().shape:
             # TODO: Decide if this is acceptable usage
@@ -254,6 +272,7 @@ class Cofunction(ufl.Cofunction, CofunctionMixin):
         elif (isinstance(expr, Cofunction)
               and expr.function_space() == self.function_space()):
             # do not annotate in case of self assignment
+            block = None
             if annotate_tape() and self != expr:
                 if subset is not Ellipsis:
                     raise NotImplementedError("Cofunction subset assignment "
@@ -265,16 +284,16 @@ class Cofunction(ufl.Cofunction, CofunctionMixin):
                 # so that we do not annotate the recursive call to assign
                 # within Cofunction.assign(BaseForm, subset=...).
                 # But we currently do not implement annotation for subset != None.
-                get_working_tape().add_block(
-                    CofunctionAssignBlock(
-                        self, expr, rhs_from_assemble=expr_from_assemble)
-                )
+                block = CofunctionAssignBlock(expr, rhs_from_assemble=expr_from_assemble)
+                get_working_tape().add_block(block)
 
             # TODO: Shouldn't need to cast the axes
             # self.dat[subset].assign(expr.dat[subset], eager=True)
             lhs = self.dat[subset]
             rhs = expr.dat[subset]
             lhs.assign(rhs, eager=True)
+            if block is not None:
+                block.add_output(self.block_variable)
             return self
         elif isinstance(expr, BaseForm) and not isinstance(expr, Cofunction):
             # Enable c.assign(B) where c is a Cofunction and B an appropriate
