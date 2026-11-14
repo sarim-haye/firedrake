@@ -76,6 +76,7 @@ class Cofunction(ufl.Cofunction, CofunctionMixin):
         # User comm
         self.comm = V.comm
         self._function_space = V
+        self._subfunctions = {}
         self.uid = utils._new_uid(self.comm)
         self._name = name or 'cofunction_%d' % self.uid
         self._label = "a cofunction"
@@ -110,15 +111,21 @@ class Cofunction(ufl.Cofunction, CofunctionMixin):
     @cached_property
     @CofunctionMixin._ad_annotate_subfunctions
     def subfunctions(self):
-        r"""Extract any sub :class:`Cofunction`\s defined on the component spaces
-        of this this :class:`Cofunction`'s :class:`.FunctionSpace`."""
+        """Extract the subfunctions on the indexed subspaces of a mixed space.
+
+        Returns
+        -------
+        tuple of Cofunction
+            Subfunctions sharing data with this cofunction, or this cofunction
+            itself if its space is not mixed.
+        """
         if functionspaceimpl.is_mixed(self.function_space()):
             subfuncs = []
             for i, component in enumerate(self.dat.axes.trees[0].root.components):
                 subspace = self.function_space().sub(i)
                 subdat = self.dat[component.label]
                 subfunc = type(self)(
-                    subspace, subdat, name=f"{self.name()}[{subspace.index}]"
+                    subspace, subdat, name=f"{self.name()}[{i}]"
                 )
                 subfuncs.append(subfunc)
             return tuple(subfuncs)
@@ -151,15 +158,19 @@ class Cofunction(ufl.Cofunction, CofunctionMixin):
         Parameters
         ----------
         i : int or sequence of int
-            For a mixed cofunction, an integer selects one subfunction and a
-            tuple or list selects subfunctions in the given order. A sequence with one
-            index returns an unmixed cofunction. For a vector or tensor cofunction, the
-            indices select a component.
+            For a mixed cofunction, use an integer to extract one subfunction,
+            or a nonempty tuple or list of distinct indices to extract
+            subfunctions in the given order. For a vector or tensor cofunction,
+            specify the indices of the component to extract.
 
         Returns
         -------
         Cofunction
-            A cofunction that shares data with the selected subfunctions or component.
+            A cofunction sharing data with the selected subfunctions or component.
+            The cofunction will be defined on ``self.function_space().sub(i)``.
+            If the sequence contains only one index, the result will be an
+            unmixed cofunction. Repeated calls with the same sequence of indices
+            will return the same cofunction.
 
         See Also
         --------
@@ -180,6 +191,7 @@ class Cofunction(ufl.Cofunction, CofunctionMixin):
                 raise ValueError("Only allowed to index a scalar, non-mixed function using '0'.")
             return self
         else:
+            i = functionspaceimpl.parse_component_indices(i, self.function_space().shape)
             return self._components[i]
 
     def function_space(self):
