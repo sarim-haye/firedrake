@@ -104,7 +104,7 @@ class NoiseBackendBase:
 
         Returns
         -------
-        Function | Cofunction :
+        firedrake.function.Function | Cofunction :
             The white noise sample in :math:`V`
         """
         raise NotImplementedError
@@ -429,7 +429,7 @@ class WhiteNoiseGenerator:
 
         Returns
         -------
-        Function | Cofunction :
+        firedrake.function.Function | Cofunction :
             The white noise sample
         """
         return self.backend.sample(
@@ -1128,6 +1128,7 @@ class CovarianceMatCtx:
         self.comm = V.mesh().comm
         self.covariance = covariance
         self.operation = operation
+        self._shift = 0
 
         primal = Function(V)
         dual = Function(V.dual())
@@ -1166,6 +1167,15 @@ class CovarianceMatCtx:
 
         with self.y.dat.vec_ro as v:
             v.copy(result=y)
+
+        if self._shift != 0:
+            y.axpy(self._shift, x)
+
+    def shift(self, A, alpha):
+        self._shift += alpha
+
+    def update(self, *args, **kwargs):
+        self._shift = 0
 
     def view(self, mat, viewer=None):
         """View object. Method usually called by PETSc with e.g. -ksp_view.
