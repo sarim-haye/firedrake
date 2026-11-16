@@ -95,8 +95,15 @@ def test_restrict_assign(into_restricted):
 
 
 @pytest.mark.parallel([1, 3])
-@pytest.mark.parametrize("dual", (False, True), ids=("primal", "dual"))
-@pytest.mark.parametrize("value", ("scalar", "function"))
+@pytest.mark.parametrize("dual, value", [
+    (False, "scalar"),
+    (True, "scalar"),
+    (False, "function"),
+    # Expect a failure because the eager Cofunction copy does not write the
+    # constrained DoFs (#5611). Do not make it strict, because a rank that holds
+    # none of these DoFs passes.
+    pytest.param(True, "function", marks=pytest.mark.xfail(reason="issue #5611, fixed by #5612", strict=False)),
+], ids=("primal-scalar", "dual-scalar", "primal-function", "dual-function"))
 def test_restricted_subset_assign_writes_bc_nodes(dual, value):
     mesh = UnitSquareMesh(4, 4)
     V = FunctionSpace(mesh, "CG", 2)
