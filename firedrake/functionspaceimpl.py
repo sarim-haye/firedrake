@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from functools import cached_property
 from immutabledict import immutabledict as idict
 from typing import Any, Literal, Self
+from types import EllipsisType
 from mpi4py import MPI
 
 import finat.ufl
@@ -292,16 +293,17 @@ class WithGeometryBase:
         return utils.readonly(components)
 
     @PETSc.Log.EventDecorator()
-    def sub(self, indices: Sequence[int] | int) -> WithGeometryBase:
+    def sub(self, indices: Sequence[int] | int | EllipsisType) -> WithGeometryBase:
         """Select subspaces of a mixed space or a tensor component.
 
         Parameters
         ----------
-        indices : int or sequence of int
+        indices : int, sequence of int, or Ellipsis
             For a mixed space, use an integer to extract an indexed subspace,
             or a nonempty tuple or list of distinct indices to extract
             subspaces in the given order. For a vector or tensor space,
-            specify the indices of the component to extract.
+            specify the indices of the component to extract. Use ``Ellipsis``
+            to select the whole space.
 
         Returns
         -------
@@ -311,6 +313,8 @@ class WithGeometryBase:
             space. Use ``collapse()`` to obtain an independent space. Repeated
             calls with the same sequence of indices will return the same space.
         """
+        if indices is Ellipsis:
+            return self
         if type(self.ufl_element()) is finat.ufl.MixedElement:
             if isinstance(indices, (tuple, list)):
                 indices = tuple(indices)
@@ -1809,8 +1813,22 @@ class FunctionSpace(AbstractFunctionSpace):
                 components[ix] = ComponentFunctionSpace(self, ix)
             return utils.readonly(components)
 
-    def sub(self, indices):
-        r"""Return a view into the ith component."""
+    def sub(self, indices: int | tuple[int, ...] | EllipsisType) -> FunctionSpace:
+        """Select a tensor component or the whole space.
+
+        Parameters
+        ----------
+        indices : int, tuple of int, or Ellipsis
+            The indices of the component to extract. Use ``Ellipsis`` to select
+            the whole space.
+
+        Returns
+        -------
+        FunctionSpace
+            The selected component space, or this space for ``Ellipsis``.
+        """
+        if indices is Ellipsis:
+            return self
         indices = parse_component_indices(indices, self.shape)
         return self._components[indices or 0]
 
@@ -2125,14 +2143,15 @@ class MixedFunctionSpace(AbstractFunctionSpace):
         :class:`MixedFunctionSpace` is composed."""
         return self._spaces
 
-    def sub(self, i: Sequence[int] | int) -> FunctionSpace | MixedFunctionSpace:
+    def sub(self, i: Sequence[int] | int | EllipsisType) -> FunctionSpace | MixedFunctionSpace:
         """Select subspaces of this mixed space.
 
         Parameters
         ----------
-        i : int or sequence of int
+        i : int, sequence of int, or Ellipsis
             Use an integer to extract an indexed subspace, or a nonempty tuple
             or list of distinct indices to extract subspaces in the given order.
+            Use ``Ellipsis`` to select the whole space.
 
         Returns
         -------
@@ -2142,6 +2161,8 @@ class MixedFunctionSpace(AbstractFunctionSpace):
             space. Use ``collapse()`` to obtain an independent space. Repeated
             calls with the same sequence of indices will return the same space.
         """
+        if i is Ellipsis:
+            return self
         if isinstance(i, (tuple, list)):
             i = tuple(range(len(self))[j] for j in i)
             if not i:
