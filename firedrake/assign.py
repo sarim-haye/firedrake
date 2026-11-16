@@ -3,11 +3,9 @@ import functools
 import numbers
 import types
 import warnings
-import weakref
 from functools import cached_property
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Hashable
 
-import cachetools
 import numpy as np
 from mpi4py import MPI
 
@@ -25,10 +23,6 @@ from firedrake.petsc import PETSc
 from firedrake.utils import IntType
 
 
-ASSIGN_OP_CACHE_SIZE = 8
-"""Number of assignment operations kept on each function or cofunction."""
-
-
 class AssignExprBuilder(DAGTraverser):
     """Traverser used for converting an expression into a pyop3 expression."""
 
@@ -40,13 +34,6 @@ class AssignExprBuilder(DAGTraverser):
         self.function_space = function_space
         self.loop_index = loop_index
         self.array_assign_safe = True
-        # Set to False when the pyop3 expression holds a copy of some values.
-        # Such an expression contains a new Dat on every call and never matches
-        # a cache key, so Assigner does not add it to the cache.
-        self.reusable = True
-        # Collect the functions and cofunctions of the expression, so that
-        # Assigner can drop a cached operation when one of them is deleted.
-        self.functions = []
         super().__init__()
 
     @functools.singledispatchmethod
@@ -55,11 +42,7 @@ class AssignExprBuilder(DAGTraverser):
 
     @process.register
     def _(self, func: Function | Cofunction, /) -> op3.Dat:
-        self.functions.append(func)
         if func.ufl_element().family() == "Real":
-            # The new Dat copies the current value of the function, so an
-            # operation built from it cannot see later changes.
-            self.reusable = False
             data = func.dat.global_data
             return (
                 op3.Dat(
@@ -268,16 +251,6 @@ class Assigner:
 
     @cached_property
     def _assign_op(self) -> Callable[[], None]:
-        """Return the operation that performs the assignment.
-
-        Building a pyop3 assignment and looking up its compiled code costs much
-        more than running it. This method therefore keeps the operation in a
-        cache on the assignee and reuses it when the same expression is
-        assigned over the same subset again. The cache key uses the pyop3
-        expression instead of the UFL expression, because UFL compares
-        coefficients by their count, and because a vector UFL expression gets
-        new free indices every time it is built.
-        """
         # Write a bare number with the eager assignment, because generated code
         # contains the value of the number and every new value would need new
         # code. Restricted spaces use generated code, because the eager
@@ -290,47 +263,58 @@ class Assigner:
             lhs = self.assignee.dat[self.subset]
             return functools.partial(lhs.assign, self.expression.value(), eager=True)
 
-        # Do not cache a cross-mesh operation, because it refers to this
-        # Assigner, and a cache entry would then make a reference cycle with
-        # the assignee.
-        if self._cross_mesh:
-            return self._build_assign_op()
+        # Reuse the assignment built for an earlier call with the same subset
+        # and the same expression structure, and call it with the dats of this
+        # call. Distinct dats that share a buffer are not cached because the
+        # assignment would then pass one buffer with two intents.
+        if self.subset is not Ellipsis and not self._cross_mesh:
+            dats = {self.assignee.dat: 0}
+            structure = _expression_structure(self.expression, dats)
+            if structure is not None and len({dat.buffer for dat in dats}) == len(dats):
+                key = (self.subset, self.mode, structure, tuple((dat.axes, dat.dtype) for dat in dats))
+                assignment, names = self._cached_assignment(key, tuple(dats))
+                return functools.partial(assignment, **dict(zip(names, dats)))
 
-        expr_builder = AssignExprBuilder(self.assignee.function_space(), None)
-        op3_expr, _ = expr_builder(self.expression)
-        if not expr_builder.reusable:
-            return self._build_assign_op(op3_expr, expr_builder.array_assign_safe)
+        return self._build_assign_op()
 
-        # Key on Dats instead of Functions, so that the cache does not keep the
-        # Functions alive. Dats compare by identity, so a hit refers to the
-        # same data.
-        cache = self.assignee._assign_op_cache
-        key = (self.assignee.dat, op3_expr, self.subset, self.mode)
-        try:
-            return cache[key].assign_op
-        except KeyError:
-            assign_op = self._build_assign_op(op3_expr, expr_builder.array_assign_safe)
-            # Watch each function of the expression once. The assignee is left
-            # out, because its deletion also deletes the cache.
-            others = {id(f): f for f in expr_builder.functions if f is not self.assignee}
-            cache[key] = _CachedAssignOp(cache, key, assign_op, others.values())
-            return assign_op
+    # Hold the cache on the topological space of the assignee, so that all
+    # functions and cofunctions of the space share it.
+    @op3.cache.cached_on(
+        lambda self, key, dats: self.assignee.function_space().topological,
+        get_key=lambda self, key, dats: key,
+        make_cache=lambda: op3.cache.LRUCache(16),
+    )
+    def _cached_assignment(self, key: tuple, dats: tuple[op3.Dat, ...]) -> tuple[op3.Assignment, tuple[str, ...]]:
+        """Build the subset assignment with placeholder dats.
 
-    def _build_assign_op(
-        self,
-        op3_expr: op3.expr.Expression | numbers.Number | None = None,
-        array_assign_safe: bool | None = None,
-    ) -> Callable[[], None]:
+        The assignment uses placeholders in place of the dats of this call, so
+        that the cache does not keep the functions alive.
+
+        Parameters
+        ----------
+        key
+            The cache key.
+        dats
+            The dats of the assignee and of the expression.
+
+        Returns
+        -------
+        tuple
+            The assignment, and the name of the placeholder of each dat in
+            ``dats`` for the keyword arguments of a call.
+
+        """
+        placeholders = {dat: op3.Dat.zeros_like(dat, prefix="placeholder") for dat in dats}
+        assignment = self._build_assign_op(placeholders)
+        return assignment, tuple(p.name for p in placeholders.values())
+
+    def _build_assign_op(self, placeholders: dict[op3.Dat, op3.Dat] | None = None) -> Callable[[], None]:
         """Build the operation that performs the assignment.
 
         Parameters
         ----------
-        op3_expr
-            The pyop3 expression of ``self.expression`` if it is already built.
-            It must be `None` for an assignment across meshes.
-        array_assign_safe
-            Whether NumPy arrays can evaluate ``op3_expr``. Only used if
-            ``op3_expr`` is given.
+        placeholders
+            Dats that replace the dats of the assignee and of the expression.
 
         """
         if self._cross_mesh:
@@ -345,10 +329,12 @@ class Assigner:
             loop_index = None
             op3_assignee = self.assignee.dat[self.subset]
 
-        if op3_expr is None:
-            expr_builder = AssignExprBuilder(self.assignee.function_space(), loop_index)
-            op3_expr, _ = expr_builder(self.expression)
-            array_assign_safe = expr_builder.array_assign_safe
+        expr_builder = AssignExprBuilder(self.assignee.function_space(), loop_index)
+        op3_expr, _ = expr_builder(self.expression)
+
+        if placeholders is not None:
+            op3_assignee = placeholders[self.assignee.dat][self.subset]
+            op3_expr = op3.replace(op3_expr, placeholders)
 
         match self.mode:
             case AssignmentMode.STANDARD:
@@ -425,7 +411,7 @@ class Assigner:
                 assignee_buffer._current_device_array[unchanged_idxs] = orig_assignee_data[unchanged_idxs]
 
         # If possible try to do the assignment by operating on numpy arrays
-        elif self.subset is Ellipsis and array_assign_safe:
+        elif self.subset is Ellipsis and expr_builder.array_assign_safe:
             # TODO: This is technically less efficient than the compile strategy
             # for repeated use. This should be exposed to the user.
             def assign_op() -> None:
@@ -437,66 +423,38 @@ class Assigner:
         return assign_op
 
 
-class _CachedAssignOp:
-    """An assignment operation in the cache of its assignee.
-
-    The operation holds the data of every function in its expression. A
-    finalizer on each of these functions removes the entry when the function
-    is deleted, so that the cache does not keep the data of a temporary
-    function alive.
+def _expression_structure(expr: ufl.core.expr.Expr, dats: dict[op3.Dat, int]) -> Hashable | None:
+    """Return the structure of an expression for the cache key of `Assigner`.
 
     Parameters
     ----------
-    cache
-        The cache of the assignee.
-    key
-        The key of this entry in ``cache``.
-    assign_op
-        The assignment operation.
-    functions
-        The functions and cofunctions of the expression, without the assignee.
+    expr
+        The expression.
+    dats
+        The dats found so far, each mapped to its position. This function adds
+        the dats of the functions and constants in ``expr``.
+
+    Returns
+    -------
+    Hashable or None
+        The expression with each function and constant replaced by the
+        position of its dat, or `None` if the assignment cannot be cached.
 
     """
-
-    def __init__(
-        self,
-        cache: cachetools.LRUCache,
-        key: tuple,
-        assign_op: Callable[[], None],
-        functions: Iterable[Function | Cofunction],
-    ) -> None:
-        self.assign_op = assign_op
-        cache_ref = weakref.ref(cache)
-        self._finalizers = []
-        for func in functions:
-            finalizer = weakref.finalize(func, _remove_cached_assign_op, cache_ref, key)
-            # Do not run the finalizer at exit, because the cache is then
-            # discarded anyway.
-            finalizer.atexit = False
-            self._finalizers.append(finalizer)
-
-    def __del__(self) -> None:
-        # Detach the finalizers when the entry is removed from the cache or the
-        # cache is deleted, so that long-lived functions do not collect
-        # finalizers of entries that no longer exist.
-        for finalizer in self._finalizers:
-            finalizer.detach()
-
-
-def _remove_cached_assign_op(cache_ref: weakref.ref, key: tuple) -> None:
-    """Remove an entry from the cache of an assignee.
-
-    Parameters
-    ----------
-    cache_ref
-        Weak reference to the cache of the assignee.
-    key
-        The key of the entry.
-
-    """
-    cache = cache_ref()
-    if cache is not None:
-        cache.pop(key, None)
+    if isinstance(expr, (Function, Cofunction)) and expr.ufl_element().family() == "Real":
+        # AssignExprBuilder copies the value of a Real function into a new Dat
+        return None
+    elif isinstance(expr, (Function, Cofunction, Constant)):
+        # Tag the position so that it cannot compare equal to a number
+        return ("dat", dats.setdefault(expr.dat, len(dats)))
+    elif isinstance(expr, ufl.classes.MultiIndex):
+        # AssignExprBuilder does not use the indices
+        return ()
+    elif not expr.ufl_operands:
+        return expr
+    else:
+        operands = tuple(_expression_structure(op, dats) for op in expr.ufl_operands)
+        return None if None in operands else (type(expr), *operands)
 
 
 @functools.singledispatch

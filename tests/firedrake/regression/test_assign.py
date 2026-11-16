@@ -2,6 +2,7 @@ import gc
 import weakref
 
 from firedrake import *
+from firedrake.assign import Assigner
 import numpy as np
 import pytest
 
@@ -71,8 +72,11 @@ def test_assign_subset_repeated(V):
         assert np.allclose(f.dat.data_ro_with_halos[bc.nodes],
                            2 * g.dat.data_ro_with_halos[bc.nodes] + i + 1)
 
-    # The expression is built again on every call, but the operation is reused
-    assert len(f._assign_op_cache) == 1
+    # The expression is built again on every call, but the assignment is
+    # reused, also for another function of the same space
+    other = Function(V)
+    assert (Assigner(f, 2 * g + h, bc.node_set)._assign_op.func
+            is Assigner(other, 2 * h + g, bc.node_set)._assign_op.func)
 
 
 def test_assign_subset_is_part_of_cache_key(V):
@@ -92,18 +96,47 @@ def test_assign_subset_is_part_of_cache_key(V):
 
 
 @pytest.mark.parametrize("subset", [False, True])
-def test_assign_does_not_keep_temporary_alive(V, subset):
-    """Assign an expression that contains a temporary function and check that
-    the cache of the assignee does not keep the temporary alive."""
+@pytest.mark.parametrize("temporary", ["assignee", "expression"])
+def test_assign_does_not_keep_temporary_alive(V, subset, temporary):
+    """Assign with a temporary function as the assignee or in the expression
+    and check that no cache keeps the function or its data alive."""
     f = Function(V)
+    g = Function(V).assign(1)
     subset = DirichletBC(V, 0, 1).node_set if subset else None
     tmp = Function(V).assign(1)
-    f.assign(2 * tmp, subset=subset)
-    tmp_ref = weakref.ref(tmp)
+    if temporary == "assignee":
+        tmp.assign(2 * g, subset=subset)
+    else:
+        f.assign(2 * tmp, subset=subset)
+    refs = [weakref.ref(tmp), weakref.ref(tmp.dat), weakref.ref(tmp.dat.buffer)]
     del tmp
     gc.collect()
-    assert tmp_ref() is None
-    assert len(f._assign_op_cache) == 0
+    assert all(ref() is None for ref in refs)
+
+
+def test_assign_subset_shared_between_functions(V):
+    """Assign the same expression with different functions of one space and
+    check that each assignment uses its own functions."""
+    bc = DirichletBC(V, 0, 1)
+    fs = [Function(V) for _ in range(3)]
+    gs = [Function(V).assign(i + 1) for i in range(3)]
+    c = Function(V).assign(10)
+    for f, g in zip(fs, gs):
+        f.assign(c + 2 * g, subset=bc.node_set)
+    for i, f in enumerate(fs):
+        assert np.allclose(f.dat.data_ro_with_halos[bc.nodes], 10 + 2 * (i + 1))
+        assert np.allclose(np.delete(f.dat.data_ro_with_halos, bc.nodes, axis=0), 0)
+
+
+def test_cofunction_assign_subset_shared_between_dual_spaces(V):
+    """Assign on a subset into cofunctions of separately built dual spaces and
+    check that they share one assignment."""
+    bc = DirichletBC(V, 0, 1)
+    c1 = Cofunction(V.dual())
+    c2 = Cofunction(V.dual())
+    d = Cofunction(V.dual()).assign(1)
+    assert (Assigner(c1, d, bc.node_set)._assign_op.func
+            is Assigner(c2, d, bc.node_set)._assign_op.func)
 
 
 def test_assign_repeated_sees_changed_constant_and_real():
