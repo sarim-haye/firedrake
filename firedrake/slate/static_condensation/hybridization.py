@@ -86,7 +86,7 @@ class HybridizationPC(SCBase):
 
         self.weight = Function(W)
         self.average_kernels = []
-        for Wi, weight in zip(W, self.weight.subfunctions):
+        for i, Wi in enumerate(W):
             shapes = (Wi.finat_element.space_dimension(), Wi.block_size)
             domain = "{[i,j]: 0 <= i < %d and 0 <= j < %d}" % shapes
             instructions = """
@@ -94,7 +94,7 @@ class HybridizationPC(SCBase):
             w[i,j] = w[i,j] + 1
         end
         """
-            par_loop((domain, instructions), ufl.dx, {"w": (weight, INC)})
+            par_loop((domain, instructions), ufl.dx, {"w": (self.weight.subfunctions[i], INC)})
 
             instructions = """
         for i, j
@@ -118,15 +118,15 @@ class HybridizationPC(SCBase):
             if bc.function_space_index() not in self.vidx:
                 raise NotImplementedError("Dirichlet bc set on unsupported space.")
 
-        trial_fields = TrialFunctions(V_d)
-        for i, gammar, trace_space in zip(self.vidx, TestFunctions(TraceSpace), TraceSpace):
-            sigma = trial_fields[i]
-            field_bcs = [bc for bc in self.ctx.row_bcs if bc.function_space_index() == i]
+        sigma = TrialFunctions(V_d)
+        gammar = TestFunctions(TraceSpace)
+        for i, j in enumerate(self.vidx):
+            field_bcs = [bc for bc in self.ctx.row_bcs if bc.function_space_index() == j]
             if mesh_unique.extruded:
-                Kform += (ufl.inner(ufl.jump(sigma, n=n), gammar('+')) * ufl.dS_h
-                          + ufl.inner(ufl.jump(sigma, n=n), gammar('+')) * ufl.dS_v)
+                Kform += (ufl.inner(ufl.jump(sigma[j], n=n), gammar[i]('+')) * ufl.dS_h
+                          + ufl.inner(ufl.jump(sigma[j], n=n), gammar[i]('+')) * ufl.dS_v)
             else:
-                Kform += ufl.inner(ufl.jump(sigma, n=n), gammar('+')) * ufl.dS
+                Kform += ufl.inner(ufl.jump(sigma[j], n=n), gammar[i]('+')) * ufl.dS
 
             # Enforce prescribed normal fluxes through exterior trace terms.
             # Set the trace to zero where L2 data are imposed weakly.
@@ -140,7 +140,7 @@ class HybridizationPC(SCBase):
                 extruded_neumann_subdomains = neumann_subdomains & {"top", "bottom"}
                 neumann_subdomains = neumann_subdomains - extruded_neumann_subdomains
 
-                integrand = ufl.inner(ufl.dot(sigma, n), gammar)
+                integrand = ufl.inner(ufl.dot(sigma[j], n), gammar[i])
                 measures = []
                 trace_subdomains = []
                 if mesh_unique.extruded:
@@ -161,7 +161,7 @@ class HybridizationPC(SCBase):
                 for measure in measures:
                     Kform += integrand*measure
 
-                trace_bcs.extend(DirichletBC(trace_space, 0, subdomain) for subdomain in trace_subdomains)
+                trace_bcs.extend(DirichletBC(TraceSpace[i], 0, subdomain) for subdomain in trace_subdomains)
 
             else:
                 # Without a prescribed normal flux, impose L2 data weakly on
@@ -174,7 +174,7 @@ class HybridizationPC(SCBase):
                         trace_subdomains.extend(["bottom", "top"])
                 elif mesh_unique.exterior_facets.global_size > 0:
                     trace_subdomains.append("on_boundary")
-                trace_bcs.extend(DirichletBC(trace_space, 0, subdomain) for subdomain in trace_subdomains)
+                trace_bcs.extend(DirichletBC(TraceSpace[i], 0, subdomain) for subdomain in trace_subdomains)
 
         # Make a SLATE tensor from Kform
         K = Tensor(Kform)
@@ -316,12 +316,12 @@ class HybridizationPC(SCBase):
             # We do this by splitting the residual equally between
             # basis functions that add together to give unbroken
             # basis functions.
-            for i, weight, kernel in zip(self.vidx, self.weight.subfunctions, self.average_kernels):
-                unbroken_res_hdiv = self.unbroken_residual.sub(i)
-                broken_res_hdiv = self.broken_residual.sub(i)
+            for i, j in enumerate(self.vidx):
+                unbroken_res_hdiv = self.unbroken_residual.sub(j)
+                broken_res_hdiv = self.broken_residual.sub(j)
                 broken_res_hdiv.assign(0)
-                par_loop(kernel, ufl.dx,
-                         {"w": (weight, READ),
+                par_loop(self.average_kernels[i], ufl.dx,
+                         {"w": (self.weight.subfunctions[i], READ),
                           "vec_in": (unbroken_res_hdiv, READ),
                           "vec_out": (broken_res_hdiv, INC)})
 
@@ -373,12 +373,12 @@ class HybridizationPC(SCBase):
             unbroken_l2_solution.dat.assign(broken_l2_solution.dat, eager=True, eager_strategy="array")
 
             # Compute the hdiv projection of the broken hdiv solution
-            for i, weight, kernel in zip(self.vidx, self.weight.subfunctions, self.average_kernels):
-                broken_hdiv = self.broken_solution.sub(i)
-                unbroken_hdiv = self.unbroken_solution.sub(i)
+            for i, j in enumerate(self.vidx):
+                broken_hdiv = self.broken_solution.sub(j)
+                unbroken_hdiv = self.unbroken_solution.sub(j)
                 unbroken_hdiv.assign(0)
-                par_loop(kernel, ufl.dx,
-                         {"w": (weight, READ),
+                par_loop(self.average_kernels[i], ufl.dx,
+                         {"w": (self.weight.subfunctions[i], READ),
                           "vec_in": (broken_hdiv, READ),
                           "vec_out": (unbroken_hdiv, INC)})
 
