@@ -3,6 +3,7 @@ import pkgconfig
 import platform
 import shutil
 import site
+import subprocess
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from glob import glob
@@ -58,7 +59,11 @@ class ExternalDependency:
 
 # MPI
 # strip the leading 'gcc' or equivalent
-mpi_args = petsctools.get_petscvariables()["MPICC_SHOW"].split()[1:]
+_mpicc_show = petsctools.get_petscvariables().get("MPICC_SHOW")
+if _mpicc_show is None:
+    # Fall back to querying mpicc directly (happens when system MPI is used)
+    _mpicc_show = subprocess.check_output(["mpicc", "--show"], text=True).strip()
+mpi_args = _mpicc_show.split()[1:]
 mpi_ = ExternalDependency(
     extra_compile_args=mpi_args,
 )
@@ -131,12 +136,15 @@ else:
 sitepackage_dirs = site.getsitepackages() + [site.getusersitepackages()]
 
 # firedrake_rtree
+rtree_library_dir = str(firedrake_rtree.get_library().parent)
 rtree_ = ExternalDependency(
-    include_dirs=[firedrake_rtree.get_include()],
-    extra_link_args=[firedrake_rtree.get_lib_filename()],
-    runtime_library_dirs=[firedrake_rtree.get_lib()] + [
-        os.path.join(dir, "firedrake_rtree") for dir in sitepackage_dirs
+    include_dirs=[str(firedrake_rtree.get_include())],
+    library_dirs=[rtree_library_dir],
+    runtime_library_dirs=[rtree_library_dir] + [
+        os.path.join(dir, "firedrake_rtree", "firedrake_rtree")
+        for dir in sitepackage_dirs
     ],
+    libraries=["firedrake_rtree"],
 )
 
 # libspatialindex

@@ -527,7 +527,12 @@ class MLIRCompiler(Compiler):
     _mlir_opt_flags = MLIR_OPT_PASSES[str(get_current_device())]
     _cflags = ("-fPIC",)
     # TODO: Add the MLIR/LLVM binary wheel. Requires linking for CUDA/AMD runtime binary
-    _ldflags = ("-shared", "-L/home/sam/Documents/llvm-project/build/lib")
+    # Directory holding the MLIR GPU runtime (e.g. libmlir_cuda_runtime), only needed for GPU builds.
+    # Set PYOP3_MLIR_RUNTIME_LIBDIR to your LLVM build's lib directory when targeting a GPU.
+    _ldflags = ("-shared",) + (
+        (f"-L{os.environ['PYOP3_MLIR_RUNTIME_LIBDIR']}",)
+        if "PYOP3_MLIR_RUNTIME_LIBDIR" in os.environ else ()
+    )
 
     _optflags = ("-O3", "-ffast-math",)
     _debugflags = ("-O0", "-g")
@@ -757,7 +762,8 @@ def make_so(compiler, code, extension, comm):
                     # NOTE: How can I guarantee this is clang??
                     cc = (
                         (compiler.cc,) + compiler.cflags + ("-march=native",)
-                        + (str(llname),) + compiler.ldflags + ("-lmlir_cuda_runtime",)
+                        + (str(llname),) + compiler.ldflags
+                        + (() if str(get_current_device()) == "CPU" else ("-lmlir_cuda_runtime",))
                         + ('-o', str(soname))
                     )
 
