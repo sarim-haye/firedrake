@@ -1,102 +1,93 @@
-"""Generate OP2 artifacts from real Firedrake forms, plus reference data for OP2's tests.
+"""Generate OP2 artifacts and OP2 test cases from real Firedrake forms.
 
-Each case assembles a P2 one-form on ``UnitSquareMesh(3, 3)``. The local kernel
-then has the arguments ``A[6]`` (INC, one entry per P2 node of the cell),
-``coords[6]`` (READ, three vertices x (x, y)) and, for some forms, ``c[1]``
-(READ). OP2 sees them as these op_args, in this order::
+Each case is a cell-integral one-form on ``UnitSquareMesh(n, n)``. For each case
+``<name>`` this assembles the form with Firedrake's GEM/MLIR backend, captures
+the local kernel, derives the OP2 loop that runs it (see ``fd2op2.bind_one_form``),
+and writes:
 
-    A0..A5  op_arg_dat(result, i, cell2node, 1, OP_INC)
-    X0..X2  op_arg_dat(coords, i, cell2vert, 2, OP_READ)
-    c       op_arg_gbl(&c, 1, OP_READ)                       (only if the form has c)
+- ``<name>.mlir``, ``<name>.mlirbc`` and ``<name>.json``: the OP2 kernel artifact.
+- ``<name>.h``: the C++ stand-in that ``op_par_loop`` names.
+- ``<name>_op2.h``: the mesh data, the ``op_par_loop`` call and Firedrake's
+  assembled vector. OP2's ``fd_artifact_test.cpp`` runs it and compares every
+  node with Firedrake's result.
 
-For each case ``<name>`` this writes the artifact (``<name>.mlir``,
-``<name>.mlirbc``, ``<name>.json``) and ``<name>_data.h``: the mesh, both maps
-in Firedrake's local ordering, and Firedrake's own assembled vector, which the
-OP2 test uses as the reference answer.
+To add a case, add an entry to ``CASES``. OP2's CMake registers a test for every
+``*_op2.h`` file that it finds.
 
 Run with the MLIR branch environment::
 
-    PYTHONPATH=firedrake-mlir:fiat-mlir python firedrake-mlir/op2_artifacts/make_fd_artifacts.py
+    PYTHONPATH=firedrake-mlir:fiat-mlir python firedrake-mlir/op2_artifacts/make_fd_artifacts.py [case ...]
 """
 
+import sys
 from pathlib import Path
 
 import numpy as np
 from firedrake import (
-    Constant, FunctionSpace, SpatialCoordinate, TestFunction, UnitSquareMesh, assemble, dx,
+    Constant, Function, FunctionSpace, SpatialCoordinate, TestFunction, UnitSquareMesh,
+    assemble, dx,
 )
 
-from fd2op2 import Op2Arg, capture_local_kernels, write_artifact
+from fd2op2 import bind_one_form, capture_local_kernels, write_artifact, write_op2_files
 
 HERE = Path(__file__).resolve().parent
-C_VALUE = 10.0
 
 
-def mass_form(mesh, v):
-    """c * v * dx. Vertex nodes get 0 and edge nodes get c * area / 3."""
-    return Constant(C_VALUE) * v * dx
+def mass_form(mesh):
+    """c * v * dx on P2. Vertex nodes get 0 and edge nodes get c * area / 3."""
+    v = TestFunction(FunctionSpace(mesh, "P", 2))
+    return Constant(10.0) * v * dx
 
 
-def xy_form(mesh, v):
-    """x * y * v * dx. Every node gets a different value, so a wrong ordering shows."""
+def xy_form(mesh, degree=2):
+    """x * y * v * dx. Almost every node gets a different value, so a wrong ordering shows."""
     x, y = SpatialCoordinate(mesh)
+    v = TestFunction(FunctionSpace(mesh, "P", degree))
     return x * y * v * dx
 
 
-CASES = {"fd_mass": mass_form, "fd_xy": xy_form}
+def coeff_form(mesh):
+    """c * f * v * dx with f a P1 coefficient and v in P2: a coefficient on a second space."""
+    f = Function(FunctionSpace(mesh, "P", 1))
+    f.dat.data[:] = np.random.default_rng(seed=0).uniform(1.0, 2.0, f.dat.data.shape)
+    v = TestFunction(FunctionSpace(mesh, "P", 2))
+    return Constant(3.0) * f * v * dx
 
 
-def build_case(name, make_form):
-    mesh = UnitSquareMesh(3, 3)
-    V = FunctionSpace(mesh, "P", 2)
+# name -> (form builder, cells per side of the unit square mesh)
+CASES = {
+    "fd_mass": (mass_form, 3),
+    "fd_xy": (xy_form, 3),
+    "fd_coeff": (coeff_form, 3),
+    "fd_p3": (lambda mesh: xy_form(mesh, degree=3), 3),
+    "fd_xy_big": (xy_form, 64),
+}
 
-    with capture_local_kernels() as kernels:
+
+def build_case(name, make_form, n):
+    form = make_form(UnitSquareMesh(n, n))
+    with capture_local_kernels(form.ufl_domain().comm) as kernels:
         result = assemble(
-            make_form(mesh, TestFunction(V)),
+            form,
             pyop3_compiler_parameters={"backend": "gem"},
             form_compiler_parameters={"backend": "gem"},
         )
-    assert len(kernels) == 1, f"{name}: expected one local kernel, got {len(kernels)}"
+    if len(kernels) != 1:
+        raise RuntimeError(f"{name}: expected one local kernel, got {len(kernels)}")
     kernel = kernels[0]
-    print(f"{name}: local kernel args", list(zip(kernel.arg_names, kernel.shapes, kernel.intents)))
 
-    A, X, *rest = kernel.arg_names
-    op2_args = (
-        [Op2Arg(A, i, 1) for i in range(6)]
-        + [Op2Arg(X, 2 * i, 2) for i in range(3)]
-        + [Op2Arg(C, 0, 1) for C in rest]
-    )
-    write_artifact(kernel, op2_args, name, HERE / f"{name}.h", HERE)
-    write_test_data(name, mesh, V, result.dat.data_ro)
+    loop = bind_one_form(form, kernel)
+    header = write_op2_files(name, kernel, loop, result.dat.data_ro, HERE)
+    write_artifact(kernel, loop.args, name, header, HERE)
 
-
-def c_array(ctype, name, values):
-    flat = ", ".join(repr(float(x)) if ctype == "double" else str(int(x))
-                     for x in np.asarray(values).ravel())
-    return f"static const {ctype} {name}[] = {{{flat}}};\n"
-
-
-def write_test_data(name, mesh, V, reference):
-    coords = mesh.coordinates.dat.data_ro
-    cell2vert = mesh.coordinates.function_space().cell_node_list
-    cell2node = V.cell_node_list
-    lines = [
-        f"// Generated by make_fd_artifacts.py: Firedrake mesh, maps and reference result for {name}.\n",
-        "#pragma once\n",
-        f"static const int {name}_ncells = {cell2node.shape[0]};\n",
-        f"static const int {name}_nverts = {coords.shape[0]};\n",
-        f"static const int {name}_nnodes = {reference.shape[0]};\n",
-        f"static const double {name}_c = {C_VALUE!r};\n",
-        c_array("double", f"{name}_coords", coords),
-        c_array("int", f"{name}_cell2vert", cell2vert),
-        c_array("int", f"{name}_cell2node", cell2node),
-        c_array("double", f"{name}_reference", reference),
-    ]
-    (HERE / f"{name}_data.h").write_text("".join(lines))
-    print(f"{name}: {cell2node.shape[0]} cells, {coords.shape[0]} vertices, "
-          f"{reference.shape[0]} P2 nodes, reference sum = {reference.sum():.15g}")
+    dats = ", ".join(f"{d.name}({d.cell_map.shape[1]}x{d.dim})" for d in loop.dats)
+    print(f"{name}: {loop.ncells} cells, {len(loop.args)} op_args [{dats}"
+          f"{', globals ' + ', '.join(loop.globals) if loop.globals else ''}], "
+          f"reference sum = {result.dat.data_ro.sum():.15g}")
 
 
 if __name__ == "__main__":
-    for name, make_form in CASES.items():
-        build_case(name, make_form)
+    names = sys.argv[1:] or list(CASES)
+    for name in names:
+        make_form, n = CASES[name]
+        build_case(name, make_form, n)
